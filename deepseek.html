@@ -2938,7 +2938,13 @@ function initialState() {
       apiUrl: "https://api.openai.com/v1/chat/completions",
       model: "gpt-4o-mini"
     },
-    github: { username: "", token: "", starredRepos: [] }
+    github: {
+  username: "", token: "", loading: false, lastFetch: null,
+  rateLimit: { remaining: null, reset: null },
+  events: [], repos: [], recentCommits: [], dailyCommits: {},
+  commitStreak: { count: 0, best: 0 },
+  starredRepos: [], error: null
+}
   };
 }
 
@@ -2971,6 +2977,9 @@ function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
    ============================================================ */
 function todayStr() {
   const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+}
+function dateStr(d) {
   return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
 }
 function dateOffset(days) {
@@ -3304,7 +3313,114 @@ ${sub}
   }
   render();
 }
+/* ============================================================
+   GITHUB API
+   ============================================================ */
+async function githubApi(path) {
+  const headers = { "Accept": "application/vnd.github+json" };
+  if (state.github.token) headers["Authorization"] = "Bearer " + state.github.token;
+  const res = await fetch("https://api.github.com" + path, { headers });
+  const remaining = res.headers.get("X-RateLimit-Remaining");
+  const reset = res.headers.get("X-RateLimit-Reset");
+  if (remaining !== null) state.github.rateLimit.remaining = +remaining;
+  if (reset !== null) state.github.rateLimit.reset = +reset * 1000;
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || ("HTTP " + res.status));
+  }
+  return res.json();
+}
 
+async function fetchGithubData() {
+  const u = state.github.username.trim();
+  if (!u) { toast("⚠️ Укажи GitHub username в настройках"); return; }
+  state.github.loading = true;
+  state.github.error = null;
+  render();
+  try {
+    const [events, repos] = await Promise.all([
+      githubApi("/users/" + encodeURIComponent(u) + "/events?per_page=100"),
+      githubApi("/users/" + encodeURIComponent(u) + "/repos?per_page=100&sort=pushed")
+    ]);
+    state.github.events = events;
+    state.github.repos = repos;
+    state.github.lastFetch = Date.now();
+    processGithubData();
+    save();
+    toast("✅ GitHub обновлён");
+  } catch (e) {
+    state.github.error = e.message;
+    toast("❌ GitHub: " + e.message);
+  }
+  state.github.loading = false;
+  render();
+}
+
+function processGithubData() {
+  const daily = {};
+  const recent = [];
+  for (const ev of state.github.events || []) {
+    if (ev.type === "PushEvent") {
+      const date = (ev.created_at || "").slice(0, 10);
+      const commits = ev.payload.commits || [];
+      if (commits.length) daily[date] = (daily[date] || 0) + commits.length;
+      for (const c of commits) {
+        recent.push({
+          date, ts: ev.created_at || "",
+          message: (c.message || "").split("\n")[0],
+          sha: (c.sha || "").slice(0, 7),
+          repo: ev.repo.name,
+          url: "https://github.com/" + ev.repo.name + "/commit/" + c.sha
+        });
+      }
+    }
+  }
+  recent.sort((a, b) => b.ts.localeCompare(a.ts));
+  state.github.dailyCommits = daily;
+  state.github.recentCommits = recent.slice(0, 20);
+  let count = 0;
+  const d = new Date();
+  if (!daily[dateStr(d)]) d.setDate(d.getDate() - 1);
+  while (daily[dateStr(d)]) { count++; d.setDate(d.getDate() - 1); }
+  state.github.commitStreak = {
+    count,
+    best: Math.max(count, state.github.commitStreak?.best || 0)
+  };
+}
+
+function toggleStarRepo(fullName) {
+  const arr = state.github.starredRepos || [];
+  const i = arr.indexOf(fullName);
+  if (i >= 0) arr.splice(i, 1);
+  else arr.push(fullName);
+  state.github.starredRepos = arr;
+  save();
+  render();
+}
+
+function openRepoPicker(levelId) {
+  if (!state.github.username) {
+    toast("⚠️ Настрой GitHub в Настройках");
+    return;
+  }
+  if (!state.github.repos.length && !state.github.loading) {
+    toast("⏳ Загружаю репозитории...");
+    fetchGithubData();
+  }
+  modal = { type: "pickRepo", returnTo: { type: "boss", levelId }, pickerTab: "repos" };
+  render();
+}
+
+function insertRepoUrl(url) {
+  const ta = document.getElementById("boss-sub");
+  if (!ta) return;
+  ta.value = (ta.value ? ta.value.trim() + "\n\n" : "") + url;
+  const level = DATA.levels.find(l => l.id === modal.returnTo.levelId);
+  if (level) setBossField(level.boss.id, "submission", ta.value);
+  modal = modal.returnTo;
+  render();
+  toast("📎 Ссылка вставлена");
+}
 /* ============================================================
    RENDER
    ============================================================ */
@@ -3319,8 +3435,8 @@ function render() {
 function renderNav() {
   const xp = totalXp(), lvl = playerLevel(xp);
   const tabs = [
-    ["dashboard", "Дашборд"], ["map", "Карта"], ["journal", "Журнал"],
-    ["badges", "Бейджи"], ["settings", "Настройки"]
+    ["dashboard", "Дашборд"], ["map", "Карта"], ["portfolio", "🐙 Портфолио"],
+    ["journal", "Журнал"], ["badges", "Бейджи"], ["settings", "Настройки"]
   ];
   return `<nav class="nav">
     <div class="brand">⚙️ Automation Quest</div>
@@ -3335,12 +3451,139 @@ function renderView() {
   switch (view.name) {
     case "dashboard": return renderDashboard();
     case "map": return renderMap();
+    case "portfolio": return renderPortfolio();
     case "level": return renderLevel();
     case "journal": return renderJournal();
     case "badges": return renderBadges();
     case "settings": return renderSettings();
     default: return renderDashboard();
   }
+}
+function renderGithubWidget() {
+  const g = state.github;
+  let html = '<div class="card"><div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">' +
+    '<h2 style="margin:0; flex:1;">🐙 GitHub</h2>' +
+    '<button class="btn-secondary btn-sm" data-action="refresh-github" ' + (g.loading ? "disabled" : "") + '>' +
+    (g.loading ? "⏳ Загрузка..." : "🔄 Обновить") + '</button>' +
+    '</div>';
+
+  if (!g.username) {
+    html += '<p class="muted">Не подключён. Настрой в <a href="#" data-action="nav" data-view="settings" style="color:var(--gh, #a78bfa)">Настройках</a> — увидишь стрик коммитов, последние коммиты и сможешь прикреплять репо к боссам.</p></div>';
+    return html;
+  }
+  if (g.error) {
+    html += '<p style="color:var(--red); font-size:13px;">⚠️ ' + escapeHtml(g.error) + '</p>';
+  }
+  const today = todayStr();
+  const todayCount = g.dailyCommits[today] || 0;
+  const streak = g.commitStreak?.count || 0;
+  const best = g.commitStreak?.best || 0;
+
+  if (todayCount > 0) {
+    html += '<div style="padding:8px 12px; border-radius:8px; font-size:13px; text-align:center; background:rgba(34,197,94,.15); color:var(--green); margin-bottom:12px;">✅ Сегодня коммитов: ' + todayCount + '</div>';
+  } else {
+    html += '<div style="padding:8px 12px; border-radius:8px; font-size:13px; text-align:center; background:rgba(245,158,11,.15); color:var(--accent); margin-bottom:12px;">⚠️ Сегодня ещё не было коммитов</div>';
+  }
+
+  html += '<div class="row" style="margin-bottom:12px;">' +
+    '<div class="stat"><div class="num">' + streak + '</div><div class="lbl">🔥 Дней подряд</div></div>' +
+    '<div class="stat"><div class="num">' + best + '</div><div class="lbl">Рекорд</div></div>' +
+    '<div class="stat"><div class="num">' + todayCount + '</div><div class="lbl">Сегодня</div></div>' +
+    '<div class="stat"><div class="num">' + (g.repos?.length || 0) + '</div><div class="lbl">Репозиториев</div></div>' +
+    '</div>';
+
+  // heatmap 7 дней
+  html += '<div style="margin-bottom:12px;"><div class="muted" style="font-size:12px; margin-bottom:6px;">Последние 7 дней</div><div style="display:flex; gap:6px;">';
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const ds = dateStr(d);
+    const cnt = g.dailyCommits[ds] || 0;
+    days.push({ date: ds, label: ["Вс","Пн","Вт","Ср","Чт","Пт","Сб"][d.getDay()], count: cnt });
+  }
+  const max = Math.max(1, ...days.map(d => d.count));
+  for (const d of days) {
+    const h = d.count ? Math.max(8, Math.round(d.count / max * 40)) : 2;
+    html += '<div style="flex:1; text-align:center;">' +
+      '<div style="height:40px; background:var(--panel-2); border-radius:6px; display:flex; align-items:flex-end; overflow:hidden;">' +
+      '<div style="width:100%; background:linear-gradient(0deg, var(--gh, #a78bfa), #c4b5fd); border-radius:6px 6px 0 0; height:' + h + 'px; min-height:2px;"></div>' +
+      '</div>' +
+      '<div style="font-size:11px; color:var(--muted); margin-top:4px;">' + d.label + '</div>' +
+      '<div style="font-size:10px; color:var(--gh, #a78bfa); font-weight:600;">' + (d.count || "") + '</div>' +
+      '</div>';
+  }
+  html += '</div></div>';
+
+  // recent commits
+  if (g.recentCommits?.length) {
+    html += '<div><div class="muted" style="font-size:12px; margin-bottom:6px;">Последние коммиты</div>';
+    for (const c of g.recentCommits.slice(0, 5)) {
+      html += '<div style="background:var(--panel-2); padding:8px 12px; border-radius:8px; font-size:13px; display:flex; gap:10px; align-items:flex-start; margin-bottom:6px;">' +
+        '<span style="color:var(--muted); font-family:monospace; font-size:12px;">' + c.sha + '</span>' +
+        '<span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' +
+        '<a href="' + c.url + '" target="_blank" rel="noopener" style="color:var(--gh, #a78bfa); text-decoration:none;">' + escapeHtml(c.message) + '</a></span>' +
+        '<span style="color:var(--muted); font-family:monospace; font-size:12px;">' + c.repo.split("/")[1] + '</span>' +
+        '</div>';
+    }
+    html += '</div>';
+  }
+
+  if (g.rateLimit.remaining !== null) {
+    const resetIn = g.rateLimit.reset ? Math.max(0, Math.round((g.rateLimit.reset - Date.now()) / 60000)) : 0;
+    html += '<div class="muted" style="font-size:11px; margin-top:8px;">API: ' + g.rateLimit.remaining + ' запросов осталось' +
+      (resetIn > 0 ? ' · сброс через ' + resetIn + ' мин' : '') +
+      (!g.token ? ' · <span style="color:var(--accent)">без токена лимит 60/час</span>' : '') +
+      '</div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function renderPortfolio() {
+  const g = state.github;
+  let html = '<h1 style="margin-top:0;">🐙 Портфолио</h1>';
+
+  if (!g.username) {
+    html += '<div class="card"><p class="muted">Подключи GitHub в <a href="#" data-action="nav" data-view="settings" style="color:var(--gh, #a78bfa)">Настройках</a>, чтобы видеть свои репозитории, помечать «портфолийные» и прикреплять их к боссам.</p></div>';
+    return html;
+  }
+
+  const starred = new Set(g.starredRepos || []);
+  let repos = g.repos || [];
+  if (view.portfolioFilter === "starred") repos = repos.filter(r => starred.has(r.full_name));
+
+  html += '<div class="row" style="margin-bottom:16px;">' +
+    '<button class="' + (view.portfolioFilter === "all" ? "btn-primary" : "btn-secondary") + ' btn-sm" data-action="portfolio-filter" data-filter="all">Все (' + (g.repos?.length || 0) + ')</button>' +
+    '<button class="' + (view.portfolioFilter === "starred" ? "btn-primary" : "btn-secondary") + ' btn-sm" data-action="portfolio-filter" data-filter="starred">⭐ В портфолио (' + starred.size + ')</button>' +
+    '<button class="btn-secondary btn-sm" data-action="refresh-github" ' + (g.loading ? "disabled" : "") + '>' + (g.loading ? "⏳" : "🔄 Обновить") + '</button>' +
+    '</div>';
+
+  if (!repos.length) {
+    html += '<div class="empty">' + (view.portfolioFilter === "starred" ? "Ты пока не добавил ни одного репо в портфолио. Нажми ⭐ на карточке." : "Репозиториев нет. Обнови данные.") + '</div>';
+    return html;
+  }
+
+  html += '<div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:12px;">';
+  for (const r of repos) {
+    const isStarred = starred.has(r.full_name);
+    html += '<div style="background:var(--panel-2); border:1px solid ' + (isStarred ? "var(--gh, #a78bfa)" : "var(--border)") + '; border-radius:10px; padding:14px; display:flex; flex-direction:column; gap:8px;">' +
+      '<a href="' + r.html_url + '" target="_blank" rel="noopener" style="font-weight:600; color:var(--gh, #a78bfa); text-decoration:none;">' + escapeHtml(r.name) + '</a>' +
+      '<div style="font-size:13px; color:var(--muted); flex:1;">' + escapeHtml(r.description || "— без описания —") + '</div>' +
+      '<div style="font-size:12px; color:var(--muted); display:flex; gap:10px; flex-wrap:wrap;">' +
+        (r.language ? '<span>🔤 ' + escapeHtml(r.language) + '</span>' : '') +
+        '<span>⭐ ' + (r.stargazers_count || 0) + '</span>' +
+        (r.pushed_at ? '<span>📅 ' + r.pushed_at.slice(0, 10) + '</span>' : '') +
+        (r.private ? '<span style="color:var(--accent)">🔒 private</span>' : '') +
+      '</div>' +
+      '<div style="display:flex; gap:6px;">' +
+        '<button class="' + (isStarred ? "btn-primary" : "btn-secondary") + ' btn-sm" data-action="star-repo" data-repo="' + escapeHtml(r.full_name) + '">' + (isStarred ? "⭐ В портфолио" : "☆ В портфолио") + '</button>' +
+        '<a class="btn-secondary btn-sm" href="' + r.html_url + '" target="_blank" rel="noopener" style="text-decoration:none; text-align:center;">Открыть</a>' +
+      '</div>' +
+      '</div>';
+  }
+  html += '</div>';
+  return html;
 }
 
 function renderDashboard() {
@@ -3368,6 +3611,8 @@ function renderDashboard() {
 
   html += `<div class="card"><h2>До следующего уровня: ${600 - xpInLevel} XP</h2>
     <div class="progress"><div style="width:${Math.round(xpInLevel/600*100)}%"></div></div></div>`;
+
+  html += renderGithubWidget();  
 
   html += `<div class="card"><h2>🎯 Текущий уровень: ${curLvl.title}</h2>
     <p class="muted">${curLvl.goal}</p>`;
@@ -3595,6 +3840,27 @@ function renderSettings() {
     <label class="field">Имя<input id="set-name" value="${escapeHtml(state.name || "")}" placeholder="Как тебя зовут?"></label>
     <button class="btn-primary" data-action="save-name">Сохранить</button></div>`;
 
+    const g = state.github;
+  html += `<div class="card"><h2>🐙 GitHub</h2>
+    <p class="muted">Интеграция показывает стрик коммитов, недавние коммиты и позволяет прикреплять репо к боссам.</p>
+    <label class="field">GitHub username<input id="gh-user" value="${escapeHtml(g.username)}" placeholder="например, octocat"></label>
+    <label class="field">Personal Access Token (опционально)<input id="gh-token" type="password" value="${escapeHtml(g.token)}" placeholder="ghp_... или пусто для публичных репо"></label>
+    <p class="muted" style="font-size:12px;">Токен нужен для приватных репо и лимита 5000/час вместо 60/час. Создай на <a href="https://github.com/settings/tokens" target="_blank" rel="noopener" style="color:var(--gh, #a78bfa)">github.com/settings/tokens</a>. Хранится только в браузере.</p>
+    <div class="row" style="margin-bottom:12px;">
+    <button class="btn-primary" data-action="save-github">💾 Сохранить</button>
+    <button class="btn-secondary" data-action="refresh-github" ${g.loading ? "disabled" : ""}>${g.loading ? "⏳ Загрузка..." : "🔄 Обновить данные"}</button>
+    </div>`;
+  if (g.lastFetch) {
+    const min = Math.round((Date.now() - g.lastFetch) / 60000);
+    html += `<p class="muted" style="font-size:12px;">Последнее обновление: ${min < 1 ? "только что" : min + " мин назад"}</p>`;
+  }
+  if (g.rateLimit.remaining !== null) {
+    html += `<p class="muted" style="font-size:12px;">Лимит API: ${g.rateLimit.remaining} запросов осталось</p>`;
+  }
+  if (g.error) {
+    html += `<p style="color:var(--red); font-size:13px;">⚠️ ${escapeHtml(g.error)}</p>`;
+  }
+  html += `</div>`;  
   html += `<div class="card"><h2>🤖 Проверка через ИИ (опционально)</h2>
     <p class="muted">Без ключа используй кнопку «📋 Скопировать промпт» и вставляй в чат с ИИ (например, сюда). С ключом — можно проверять прямо в приложении. Ключ хранится только в браузере.</p>
     <label class="field">API URL<input id="set-url" value="${escapeHtml(state.settings.apiUrl)}"></label>
@@ -3640,8 +3906,9 @@ function renderModal() {
       <h4>Требования:</h4>
       <ul>${boss.requirements.map(r => `<li>${r}</li>`).join("")}</ul>
       <label class="field">Твоё решение (код, описание, ссылки)<textarea id="boss-sub" style="min-height:150px;" placeholder="Вставь код, ссылку на GitHub, описание...">${escapeHtml(st.submission || "")}</textarea></label>
-      <div class="row" style="margin-bottom:12px;">
+            <div class="row" style="margin-bottom:12px;">
         <button class="btn-primary" data-action="copy-review" data-level="${level.id}">📋 Скопировать промпт</button>
+        <button class="btn-secondary" data-action="open-repo-picker" data-level="${level.id}">📎 Прикрепить GitHub</button>
         <button class="btn-secondary" data-action="check-boss-ai" data-level="${level.id}">🤖 Проверить через ИИ</button>
       </div>
       <label class="field">Вердикт / обратная связь<textarea id="boss-verdict" style="min-height:120px;" placeholder="Вставь ответ ИИ: ЗАЧТЕНО / НЕ ЗАЧТЕНО, замечания...">${escapeHtml(st.verdict || "")}</textarea></label>
@@ -3651,6 +3918,54 @@ function renderModal() {
       : `<div class="row"><button class="btn-primary" data-action="mark-boss" data-boss="${boss.id}">✅ Отметить как зачтено (+${boss.xp} XP)</button>
         <button class="btn-secondary" data-action="close-modal">Закрыть</button></div>`}
     </div></div>`;
+    return html;
+  }
+    if (modal.type === "pickRepo") {
+    const g = state.github;
+    const tab = modal.pickerTab || "repos";
+    let html = '<div class="modal-overlay" data-action="close-picker-bg"><div class="modal" onclick="event.stopPropagation()">';
+    html += '<h2>📎 Прикрепить GitHub-ссылку</h2>';
+    html += '<div class="row" style="margin-bottom:12px;">' +
+      '<button class="' + (tab === "repos" ? "btn-primary" : "btn-secondary") + ' btn-sm" data-action="picker-tab" data-tab="repos">📁 Репозитории (' + (g.repos?.length || 0) + ')</button>' +
+      '<button class="' + (tab === "commits" ? "btn-primary" : "btn-secondary") + ' btn-sm" data-action="picker-tab" data-tab="commits">📝 Коммиты (' + (g.recentCommits?.length || 0) + ')</button>' +
+      '</div>';
+    if (g.loading) {
+      html += '<p class="muted">⏳ Загружаю данные GitHub...</p>';
+    } else if (tab === "repos") {
+      if (!g.repos?.length) {
+        html += '<p class="muted">Нет репозиториев. Обнови данные в Настройках.</p>';
+      } else {
+        html += '<div style="display:flex; flex-direction:column; gap:6px; max-height:400px; overflow-y:auto;">';
+        for (const r of g.repos) {
+          html += '<div style="background:var(--panel-2); padding:10px 12px; border-radius:8px; display:flex; gap:10px; align-items:center; cursor:pointer;" data-action="pick-repo" data-url="' + escapeHtml(r.html_url) + '">' +
+            '<div style="flex:1; min-width:0;">' +
+            '<div style="font-weight:600;">' + escapeHtml(r.name) + (r.private ? ' 🔒' : '') + '</div>' +
+            '<div style="font-size:12px; color:var(--muted);">' + escapeHtml(r.description || "—") + ' · ' + (r.language || "—") + '</div>' +
+            '</div>' +
+            '<button class="btn-primary btn-sm">Вставить</button>' +
+            '</div>';
+        }
+        html += '</div>';
+      }
+    } else {
+      if (!g.recentCommits?.length) {
+        html += '<p class="muted">Нет коммитов в кеше. Обнови данные.</p>';
+      } else {
+        html += '<div style="display:flex; flex-direction:column; gap:6px; max-height:400px; overflow-y:auto;">';
+        for (const c of g.recentCommits) {
+          html += '<div style="background:var(--panel-2); padding:10px 12px; border-radius:8px; display:flex; gap:10px; align-items:center; cursor:pointer;" data-action="pick-repo" data-url="' + escapeHtml(c.url) + '">' +
+            '<div style="flex:1; min-width:0;">' +
+            '<div style="font-weight:600;">' + escapeHtml(c.message) + '</div>' +
+            '<div style="font-size:12px; color:var(--muted);">' + escapeHtml(c.repo) + ' · ' + c.sha + ' · ' + c.date + '</div>' +
+            '</div>' +
+            '<button class="btn-primary btn-sm">Вставить</button>' +
+            '</div>';
+        }
+        html += '</div>';
+      }
+    }
+    html += '<div style="margin-top:16px;"><button class="btn-secondary" data-action="close-picker">← Назад</button></div>';
+    html += '</div></div>';
     return html;
   }
   return "";
@@ -3683,6 +3998,14 @@ function bindEvents() {
       setBossField(level.boss.id, "submission", sub);
       copyReviewPrompt(+el.dataset.level);
     }
+    else if (action === "open-repo-picker") { openRepoPicker(+el.dataset.level); }
+    else if (action === "close-picker") { modal = modal.returnTo; render(); }
+    else if (action === "close-picker-bg" && e.target === el) { modal = modal.returnTo; render(); }
+    else if (action === "picker-tab") { modal.pickerTab = el.dataset.tab; render(); }
+    else if (action === "pick-repo") { insertRepoUrl(el.dataset.url); }
+    else if (action === "star-repo") { toggleStarRepo(el.dataset.repo); }
+    else if (action === "portfolio-filter") { view.portfolioFilter = el.dataset.filter; render(); }
+    else if (action === "refresh-github") { fetchGithubData(); }
     else if (action === "check-boss-ai") {
       const sub = document.getElementById("boss-sub").value;
       const level = DATA.levels.find(l => l.id === +el.dataset.level);
@@ -3706,6 +4029,14 @@ function bindEvents() {
     else if (action === "save-name") {
       state.name = document.getElementById("set-name").value.trim();
       save(); toast("💾 Сохранено"); render();
+    }
+      else if (action === "save-github") {
+      state.github.username = document.getElementById("gh-user").value.trim();
+      state.github.token = document.getElementById("gh-token").value.trim();
+      save();
+      toast("💾 GitHub сохранён. Загружаю данные...");
+      if (state.github.username) fetchGithubData();
+      else render();
     }
     else if (action === "save-api") {
       state.settings.apiUrl = document.getElementById("set-url").value.trim() || state.settings.apiUrl;
