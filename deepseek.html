@@ -2949,6 +2949,7 @@ function initialState() {
 }
 
 let state = loadState();
+state.github.loading = false;
 let view = { name: "dashboard", levelId: null, section: "theory" };
 let modal = null;
 
@@ -3334,25 +3335,83 @@ async function githubApi(path) {
 async function fetchGithubData() {
   const u = state.github.username.trim();
   if (!u) { toast("⚠️ Укажи GitHub username в настройках"); return; }
-  state.github.loading = true;
-  state.github.error = null;
+  
+  state.github.loading = true; 
+  state.github.error = null; 
   render();
+  
   try {
-    const [events, repos] = await Promise.all([
-      githubApi("/users/" + encodeURIComponent(u) + "/events?per_page=100"),
-      githubApi("/users/" + encodeURIComponent(u) + "/repos?per_page=100&sort=pushed")
-    ]);
-    state.github.events = events;
+    // 1. Получаем список репозиториев
+    const repos = await githubApi("/users/" + encodeURIComponent(u) + "/repos?per_page=100&sort=pushed");
     state.github.repos = repos;
+
+    // 2. Берем коммиты из 5 самых свежих репозиториев напрямую
+    const daily = {};
+    const recent = [];
+    
+    // Берем только те репозитории, куда пушили (до 5 штук)
+    for (const repo of repos.slice(0, 5)) {
+      try {
+        const commits = await githubApi(`/repos/${repo.full_name}/commits?per_page=50`);
+        for (const c of commits) {
+          // Проверяем, что коммит твой (или у него нет автора, например, если это веб-коммит)
+          const authorName = c.author ? c.author.login : "";
+          const commitName = c.commit.author.name || "";
+          
+          if (authorName.toLowerCase() === u.toLowerCase() || commitName.toLowerCase() === u.toLowerCase() || authorName === "") {
+            // Перевод в локальное время
+            const d = new Date(c.commit.author.date);
+            const localDate = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+            
+            recent.push({
+              date: localDate,
+              ts: c.commit.author.date,
+              message: c.commit.message.split("\n")[0],
+              sha: c.sha.slice(0, 7),
+              repo: repo.full_name,
+              url: c.html_url
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("Не удалось прочитать репо", repo.name, e);
+      }
+    }
+
+    // Сортируем от новых к старым
+    recent.sort((a, b) => b.ts.localeCompare(a.ts));
+    
+    // Считаем график
+    for (const c of recent) {
+      daily[c.date] = (daily[c.date] || 0) + 1;
+    }
+
+    state.github.dailyCommits = daily;
+    state.github.recentCommits = recent.slice(0, 20);
+    
+    // Считаем стрик
+    let count = 0; 
+    const d = new Date();
+    const todayStr = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+    
+    if (!daily[todayStr]) d.setDate(d.getDate() - 1); 
+    
+    while (true) {
+      const ds = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+      if (daily[ds]) { count++; d.setDate(d.getDate() - 1); }
+      else break;
+    }
+    state.github.commitStreak = { count, best: Math.max(count, state.github.commitStreak?.best || 0) };
+    
     state.github.lastFetch = Date.now();
-    processGithubData();
-    save();
     toast("✅ GitHub обновлён");
   } catch (e) {
     state.github.error = e.message;
-    toast("❌ GitHub: " + e.message);
+    alert("ОШИБКА: " + e.message);
   }
-  state.github.loading = false;
+  
+  state.github.loading = false; 
+  save();
   render();
 }
 
@@ -3361,7 +3420,8 @@ function processGithubData() {
   const recent = [];
   for (const ev of state.github.events || []) {
     if (ev.type === "PushEvent") {
-      const date = (ev.created_at || "").slice(0, 10);
+      const d = new Date(ev.created_at);
+      const date = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
       const commits = ev.payload.commits || [];
       if (commits.length) daily[date] = (daily[date] || 0) + commits.length;
       for (const c of commits) {
@@ -3474,7 +3534,8 @@ function renderGithubWidget() {
   if (g.error) {
     html += '<p style="color:var(--red); font-size:13px;">⚠️ ' + escapeHtml(g.error) + '</p>';
   }
-  const today = todayStr();
+  const now = new Date();
+  const today = now.getFullYear() + "-" + String(now.getMonth()+1).padStart(2,"0") + "-" + String(now.getDate()).padStart(2,"0");
   const todayCount = g.dailyCommits[today] || 0;
   const streak = g.commitStreak?.count || 0;
   const best = g.commitStreak?.best || 0;
